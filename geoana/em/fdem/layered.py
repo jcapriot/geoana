@@ -401,7 +401,7 @@ class MagneticDipoleLayeredHalfSpace(BaseFDEM, BaseMagneticDipole):
         dxyz = xyz - self.location
         offsets = np.linalg.norm(dxyz[:, :-1], axis=-1)
 
-        # Comput transform operations
+        # Compute transform operations
         # -1 gives lagged convolution in dlf
         ht, htarg = check_hankel('dlf', {'dlf': 'key_101_2009', 'pts_per_dec': 0}, 1)
         fhtfilt = htarg['dlf']
