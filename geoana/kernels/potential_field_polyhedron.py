@@ -221,6 +221,19 @@ def _combine_newtonian(order, r_a, r_b, L, edge_lengths, E, h, omega, n, F):
     ``h`` and ``omega`` (..., n_faces) are each face's height and solid angle,
     and ``n``, ``F`` (..., n_faces, 3[, 3]) its normal and dyad.
     """
+    if order not in (0, 1, 2):
+        raise ValueError(f"order must be 0, 1 or 2, got {order}")
+    return _edge_newtonian(order, r_a, r_b, L, edge_lengths, E) + _face_newtonian(
+        order, h, omega, n, F
+    )
+
+
+def _edge_newtonian(order, r_a, r_b, L, edge_lengths, E):
+    """The edge terms' part of ``_combine_newtonian``, summed over the edges.
+
+    The sum is over the edge axis directly, without forming per-edge
+    (..., n_edges, 3, 3) temporaries.
+    """
     on_edge = np.isinf(L)
     if order < 2:
         # On an edge L is infinite, but it multiplies E . r_a, which vanishes
@@ -235,13 +248,22 @@ def _combine_newtonian(order, r_a, r_b, L, edge_lengths, E, h, omega, n, F):
         L = np.where(on_edge, finite, L)
     if order == 0:
         er = np.einsum("...ei,...eij,...ej->...e", r_a, E, r_a)
-        return 0.5 * (er * L).sum(axis=-1) - 0.5 * (h * h * omega).sum(axis=-1)
+        return 0.5 * (er * L).sum(axis=-1)
     if order == 1:
-        return -np.einsum("...eij,...ej,...e->...i", E, r_a, L) + np.einsum(
-            "...fi,...f,...f->...i", n, h, omega
-        )
+        return -np.einsum("...eij,...ej,...e->...i", E, r_a, L)
     if order == 2:
-        return np.einsum("...eij,...e->...ij", E, L) - np.einsum("...fij,...f->...ij", F, omega)
+        return np.einsum("...eij,...e->...ij", E, L)
+    raise ValueError(f"order must be 0, 1 or 2, got {order}")
+
+
+def _face_newtonian(order, h, omega, n, F):
+    """The face terms' part of ``_combine_newtonian``, summed over the faces."""
+    if order == 0:
+        return -0.5 * (h * h * omega).sum(axis=-1)
+    if order == 1:
+        return np.einsum("...fi,...f,...f->...i", n, h, omega)
+    if order == 2:
+        return -np.einsum("...fij,...f->...ij", F, omega)
     raise ValueError(f"order must be 0, 1 or 2, got {order}")
 
 

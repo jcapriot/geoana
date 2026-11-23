@@ -338,3 +338,112 @@ class TestPolyhedron:
         tr_in = np.trace(p.gravitational_gradient(self.inside), axis1=-2, axis2=-1)
         npt.assert_allclose(tr_out, 0.0, atol=1e-12 * G * 2.0)
         npt.assert_allclose(tr_in, -4 * np.pi * G * 2.0, rtol=1e-10)
+
+
+def _merge(*bodies):
+    """Combine (V, F) surfaces into one, merging coincident vertices."""
+    V = np.vstack([v for v, _ in bodies])
+    offsets = np.cumsum([0] + [len(v) for v, _ in bodies[:-1]])
+    F = np.vstack([f + o for (_, f), o in zip(bodies, offsets)])
+    V, inv = np.unique(V, axis=0, return_inverse=True)
+    return V, inv.reshape(-1)[F]
+
+
+class TestPolyhedronShells:
+    """Surfaces made of several closed shells, wound either way."""
+
+    a = (np.r_[0.0, 0.0, 0.0], np.r_[1.0, 1.0, 1.0])
+    b = (np.r_[3.0, 0.5, -1.0], np.r_[4.0, 2.0, 0.5])
+    rng = np.random.default_rng(3)
+    xyz = rng.uniform(-3, 6, (300, 3))
+
+    def _check(self, poly, prisms, signs, xyz=None, rtol=1e-10):
+        xyz = self.xyz if xyz is None else xyz
+        for method in METHODS:
+            want = sum(
+                s * getattr(gravity.Prism(lo, hi, rho=2.0), method)(xyz)
+                for (lo, hi), s in zip(prisms, signs)
+            )
+            got = getattr(poly, method)(xyz)
+            npt.assert_allclose(got, want, rtol=rtol, atol=1e-12 * np.max(np.abs(want)))
+
+    @pytest.mark.parametrize("flip", [(False, False), (False, True), (True, False), (True, True)])
+    def test_disjoint_shells_any_winding(self, flip):
+        bodies = []
+        for (lo, hi), f in zip((self.a, self.b), flip):
+            V, F = _box_polyhedron(lo, hi)
+            bodies.append((V, F[:, ::-1] if f else F))
+        poly = gravity.Polyhedron(*_merge(*bodies), rho=2.0)
+        npt.assert_allclose(poly.volume, 1.0 + 1.5 * 1.5)
+        self._check(poly, (self.a, self.b), (1, 1))
+
+    @pytest.mark.parametrize("flip", [(False, False), (False, True), (True, False), (True, True)])
+    def test_cavity_any_winding(self, flip):
+        outer = (np.r_[-2.0, -2.0, -2.0], np.r_[2.0, 2.0, 2.0])
+        inner = (np.r_[-0.5, -1.0, -0.25], np.r_[1.0, 0.5, 0.75])
+        bodies = []
+        for (lo, hi), f in zip((outer, inner), flip):
+            V, F = _box_polyhedron(lo, hi)
+            bodies.append((V, F[:, ::-1] if f else F))
+        poly = gravity.Polyhedron(*_merge(*bodies), rho=2.0)
+        npt.assert_allclose(poly.volume, 64.0 - 1.5 * 1.5 * 1.0)
+        self._check(poly, (outer, inner), (1, -1))
+
+    def test_island_in_cavity(self):
+        boxes = [
+            (np.r_[-3.0, -3.0, -3.0], np.r_[3.0, 3.0, 3.0]),
+            (np.r_[-2.0, -2.0, -2.0], np.r_[2.0, 2.0, 2.0]),
+            (np.r_[-1.0, -0.5, -1.0], np.r_[0.5, 1.0, 1.0]),
+        ]
+        # Wind them all inward: depths 0, 1, 2 are solid, cavity, solid.
+        bodies = [(V, F[:, ::-1]) for V, F in (_box_polyhedron(*b) for b in boxes)]
+        poly = gravity.Polyhedron(*_merge(*bodies), rho=2.0)
+        self._check(poly, boxes, (1, -1, 1))
+
+    @pytest.mark.parametrize("flip", [False, True])
+    def test_shells_touching_along_an_edge(self, flip):
+        # The boxes share the edge x = y = 1, 0 <= z <= 1, which then has four
+        # faces; one box may be wound inward.
+        c = (np.r_[1.0, 1.0, 0.0], np.r_[2.5, 2.0, 1.0])
+        Va, Fa = _box_polyhedron(*self.a)
+        Vc, Fc = _box_polyhedron(*c)
+        V, F = _merge((Va, Fa), (Vc, Fc[:, ::-1] if flip else Fc))
+        poly = gravity.Polyhedron(V, F, rho=2.0)
+        npt.assert_allclose(poly.volume, 1.0 + 1.5)
+        on_edge = np.array([[1.0, 1.0, 0.5], [1.0, 1.0, 0.0], [1.0, 1.0, 0.2]])
+        self._check(poly, (self.a, c), (1, 1), xyz=np.vstack([self.xyz, on_edge]))
+
+    def test_shells_touching_at_a_vertex(self):
+        c = (np.r_[1.0, 1.0, 1.0], np.r_[2.0, 3.0, 2.5])
+        Va, Fa = _box_polyhedron(*self.a)
+        Vc, Fc = _box_polyhedron(*c)
+        poly = gravity.Polyhedron(*_merge((Va, Fa), (Vc, Fc[:, ::-1])), rho=2.0)
+        self._check(poly, (self.a, c), (1, 1), xyz=np.vstack([self.xyz, [[1.0, 1.0, 1.0]]]))
+
+    def test_errors(self):
+        V, F = _box_polyhedron(*self.a)
+        with pytest.raises(ValueError, match="at least 4 faces"):
+            gravity.Polyhedron(V, np.empty((0, 3), dtype=int))
+        bad = F.copy()
+        bad[0, 1] = bad[0, 0]
+        with pytest.raises(ValueError, match="repeats a vertex"):
+            gravity.Polyhedron(V, bad)
+        # Repeating faces leaves edges traversed unevenly.
+        with pytest.raises(ValueError, match="not closed or not consistently oriented"):
+            gravity.Polyhedron(V, np.vstack([F, F[:3]]))
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_polyhedron_blocks_match(monkeypatch, method):
+    # Summing the edge and face terms in small blocks gives the same result.
+    import geoana.shapes as shapes
+
+    lo, hi = np.r_[-1.0, -2.0, -3.0], np.r_[2.0, 1.5, 0.5]
+    V, F = _box_polyhedron(lo, hi)
+    poly = gravity.Polyhedron(V, F, rho=2.0)
+    xyz = np.random.default_rng(5).uniform(-4, 4, (5, 7, 3))
+    want = getattr(poly, method)(xyz)
+    monkeypatch.setattr(shapes, "_BLOCK_SIZE", 3)
+    got = getattr(poly, method)(xyz)
+    assert got.shape == want.shape
+    npt.assert_allclose(got, want, rtol=1e-12, atol=1e-14 * np.max(np.abs(want)))

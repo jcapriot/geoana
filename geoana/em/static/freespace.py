@@ -289,10 +289,13 @@ class _PolyhedronMagnetics:
             Magnetic flux density at location xyz in units :math:`T`.
         """
         xyz = check_xyz_dim(xyz)
-        H = self.magnetic_field(xyz)
+        # The Hessian and the inside fraction share the faces' solid angles, so
+        # evaluate them together.
+        hessian, inside = self._evaluate(xyz, 2, inside_fraction=True)
+        H = 1.0 / (4 * np.pi) * hessian @ self.magnetization
         # Weighted by the fraction of a small sphere about each point inside the
         # body (1/2 on a face), as for MagneticPrism.
-        H += self._inside_fraction(xyz)[..., None] * self.magnetization
+        H += inside[..., None] * self.magnetization
         return mu_0 * H
 
 

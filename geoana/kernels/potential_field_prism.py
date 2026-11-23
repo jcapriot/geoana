@@ -150,10 +150,16 @@ def _prism_fzx(x, y, z):
     # with the distance d to it; keep the finite part.
     neg = y < 0
     temp = x * x + z * z
-    on = neg & (temp == 0)
-    out[on] = np.log(-2 * y[on])
-    near = neg & (temp != 0)
+    near = neg & (temp >= np.finfo(float).tiny) & (temp > (r - y) * 1e-300)
     out[near] = np.log((r[near] - y[near]) / temp[near])
+    # Where the squared distance to the axis is subnormal or zero (or the
+    # ratio overflows), split the log; hypot avoids the squares.
+    rest = neg & ~near
+    d = np.hypot(x[rest], z[rest])
+    with np.errstate(divide="ignore"):
+        out[rest] = np.where(
+            d == 0, np.log(-2 * y[rest]), np.log(r[rest] - y[rest]) - 2 * np.log(d)
+        )
 
     v = y + r
     pos = ~neg & (v != 0)
@@ -188,10 +194,16 @@ def _prism_fzy(x, y, z):
     # with the distance d to it; keep the finite part.
     neg = x < 0
     temp = y * y + z * z
-    on = neg & (temp == 0)
-    out[on] = np.log(-2 * x[on])
-    near = neg & (temp != 0)
+    near = neg & (temp >= np.finfo(float).tiny) & (temp > (r - x) * 1e-300)
     out[near] = np.log((r[near] - x[near]) / temp[near])
+    # Where the squared distance to the axis is subnormal or zero (or the
+    # ratio overflows), split the log; hypot avoids the squares.
+    rest = neg & ~near
+    d = np.hypot(y[rest], z[rest])
+    with np.errstate(divide="ignore"):
+        out[rest] = np.where(
+            d == 0, np.log(-2 * x[rest]), np.log(r[rest] - x[rest]) - 2 * np.log(d)
+        )
 
     v = x + r
     pos = ~neg & (v != 0)

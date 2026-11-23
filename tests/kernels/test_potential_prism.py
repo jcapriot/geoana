@@ -178,3 +178,35 @@ def test_log_kernels_near_negative_axis(compiled):
     # prism_fz = x log(y + r) + y log(x + r) at z = 0.
     npt.assert_allclose(fz(d, y, zero), d * log_y_r + y * np.log(d + np.sqrt(d * d + 4)), rtol=1e-14)
     npt.assert_allclose(fzx(zero, y, zero), np.log(4.0))
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+@pytest.mark.parametrize("d", [1e-155, 1e-160, 1e-170, 1e-200])
+def test_log_kernels_near_negative_axis_tiny_distance(compiled, d):
+    # d**2 is subnormal or underflows to zero; the kernel must stay finite and
+    # equal -log(y + r) = log(r - y) - 2 log(d).
+    fzx = pf.prism_fzx if compiled else pf._prism_fzx
+    fzy = pf.prism_fzy if compiled else pf._prism_fzy
+    want = np.log(2.0) - 2 * np.log(d)
+    npt.assert_allclose(fzx(np.array([d]), np.array([-1.0]), np.array([0.0])), want, rtol=1e-14)
+    npt.assert_allclose(fzy(np.array([-1.0]), np.array([0.0]), np.array([d])), want, rtol=1e-14)
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_log_kernels_near_negative_axis_ratio_overflow(compiled):
+    # x**2 + z**2 is normal, but (r - y) / (x**2 + z**2) overflows.
+    fzx = pf.prism_fzx if compiled else pf._prism_fzx
+    d, y = 1e-150, -1e10
+    want = np.log(2e10) - 2 * np.log(d)
+    npt.assert_allclose(fzx(np.array([d]), np.array([y]), np.array([0.0])), want, rtol=1e-14)
+
+
+@pytest.mark.parametrize("compiled", [True, False])
+def test_log_kernels_near_negative_axis_single_log(compiled):
+    # Away from underflow the kernel is a single log of the ratio.
+    fzx = pf.prism_fzx if compiled else pf._prism_fzx
+    rng = np.random.default_rng(7)
+    x, z = rng.uniform(-5, 5, (2, 1000))
+    y = -rng.uniform(0.01, 5, 1000)
+    r = np.sqrt(x * x + y * y + z * z)
+    npt.assert_allclose(fzx(x, y, z), np.log((r - y) / (x * x + z * z)), rtol=1e-15, atol=1e-15)

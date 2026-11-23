@@ -3,7 +3,8 @@
 # cython: embedsignature=True
 cimport cython
 
-from libc.math cimport sqrt, log, atan
+from libc.math cimport sqrt, log, atan, hypot
+from libc.float cimport DBL_MIN
 
 
 cdef inline double _plus_r(double a, double b, double c, double r) nogil:
@@ -148,9 +149,16 @@ cdef api double prism_fzx(double x, double y, double z) nogil:
         # (x**2 + z**2) / (r - y). On the axis the kernel diverges as
         # -2 ln(d) with the distance d to it; keep the finite part.
         temp = x * x + z * z
+        # Checked before dividing so the ratio can't overflow (which would
+        # also raise the floating point overflow flag).
+        if temp >= DBL_MIN and temp > (r - y) * 1e-300:
+            return log((r - y) / temp)
+        # The squared distance to the axis is subnormal or zero (or the
+        # ratio overflows), so split the log; hypot avoids the squares.
+        temp = hypot(x, z)
         if temp == 0.0:
             return log(-2 * y)
-        return log((r - y) / temp)
+        return log(r - y) - 2 * log(temp)
     v = y + r
     if v == 0.0:
         return 0.0
@@ -186,9 +194,16 @@ cdef api double prism_fzy(double x, double y, double z) nogil:
         # (y**2 + z**2) / (r - x). On the axis the kernel diverges as
         # -2 ln(d) with the distance d to it; keep the finite part.
         temp = y * y + z * z
+        # Checked before dividing so the ratio can't overflow (which would
+        # also raise the floating point overflow flag).
+        if temp >= DBL_MIN and temp > (r - x) * 1e-300:
+            return log((r - x) / temp)
+        # The squared distance to the axis is subnormal or zero (or the
+        # ratio overflows), so split the log; hypot avoids the squares.
+        temp = hypot(y, z)
         if temp == 0.0:
             return log(-2 * x)
-        return log((r - x) / temp)
+        return log(r - x) - 2 * log(temp)
     v = x + r
     if v == 0.0:
         return 0.0

@@ -23,9 +23,11 @@ from scipy.sparse.csgraph import connected_components
 
 from geoana.kernels.potential_field_polyhedron import (
     polyhedron_edge_log,
+    triangle_solid_angle,
     face_edge_solid_angle,
     _canonical_face_normals,
-    _combine_newtonian,
+    _edge_newtonian,
+    _face_newtonian,
     _edge_dyads,
     _inside_fraction,
 )
@@ -38,6 +40,16 @@ __all__ = [
 
 # Faces whose unit normals differ by less than this are treated as coplanar.
 _COPLANAR_TOL = 1e-12
+
+# Number of (observation point, edge) pairs evaluated at once when summing a
+# polyhedron's edge and face terms. It bounds the temporaries, so the memory
+# used scales with the output, not with the number of points times the number
+# of edges.
+_BLOCK_SIZE = 2**18
+
+# Generalized winding numbers this close to 0 or 1 decide whether a point is
+# outside or inside a shell; anything else means the point is on its surface.
+_WINDING_TOL = 1e-6
 
 
 class BasePrism:
@@ -209,15 +221,22 @@ class BasePolyhedron:
     end points. These conventions are additive, so bodies that tile a region sum
     to that region's values on their shared boundaries as well.
 
+    The surface may consist of several closed shells, for example disjoint
+    bodies or a body with cavities. The body is the region enclosed by an odd
+    number of shells, so a shell inside one other shell is a cavity. Shells may
+    touch at vertices and edges, but must not otherwise intersect.
+
     Parameters
     ----------
     vertices : (n_vertices, 3) array_like of float
         Vertex locations.
     faces : (n_faces, 3) array_like of int
-        Vertex indices of each triangular face. Every edge must be shared by
-        exactly two faces traversed in opposite directions, i.e. the surface is
-        closed and consistently oriented. The orientation may be either inward
-        or outward; it is made outward on construction.
+        Vertex indices of each triangular face. The surface must be closed and
+        consistently oriented within each shell: every edge is traversed equally
+        often in each direction, by two faces at an ordinary edge, or by more
+        where the surface touches itself along an edge. Each shell may be wound either
+        inward or outward; they are reoriented on construction so that the
+        normals point out of the body (into a cavity).
 
     References
     ----------
@@ -242,43 +261,173 @@ class BasePolyhedron:
             raise ValueError(f"faces must have shape (n_faces, 3), got {faces.shape}")
         if not np.issubdtype(faces.dtype, np.integer):
             raise TypeError(f"faces must be integer indices, got {faces.dtype}")
+        if len(faces) < 4:
+            raise ValueError(
+                f"a closed polyhedron needs at least 4 faces, got {len(faces)}"
+            )
         if faces.min() < 0 or faces.max() >= len(vertices):
             raise ValueError("faces reference a vertex index out of range")
+        if np.any(
+            (faces[:, 0] == faces[:, 1])
+            | (faces[:, 1] == faces[:, 2])
+            | (faces[:, 2] == faces[:, 0])
+        ):
+            raise ValueError("a face repeats a vertex index")
         self._vertices = vertices
         self._faces = faces.astype(np.intp)
         self._build_edges()
-        if self.volume < 0:
-            self._faces = self._faces[:, ::-1].copy()
-            self._build_edges()
+        self._orient_shells()
         if self.volume <= 0:
             raise ValueError("polyhedron has zero volume")
         self._build_dyads()
 
+    def _directed_edges(self):
+        """Each face's three directed edges, face by face in blocks: (3 n_faces, 2)."""
+        f = self._faces
+        return np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+
     def _build_edges(self):
+        """Validate the surface, find its shells, and pair the faces at each edge.
+
+        Every undirected edge must be traversed equally often in each direction.
+        Faces are first joined into shells across ordinary (two-face) edges.
+        Then, within each shell, each face traversing an edge forwards is paired
+        with one traversing it backwards. Where the surface touches itself along
+        an edge, that edge appears once per pair. The edge dyad is a sum of
+        per-face terms, so the pairing does not change the result.
+        """
         faces = self._faces
-        directed = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
-        owner = np.tile(np.arange(len(faces)), 3)
-        key = {}
-        for (a, b), f in zip(map(tuple, directed), owner):
-            if (a, b) in key:
+        n_faces = len(faces)
+        n_v = len(self._vertices)
+        directed = self._directed_edges()
+        owner = np.tile(np.arange(n_faces), 3)
+        lo = np.minimum(directed[:, 0], directed[:, 1])
+        hi = np.maximum(directed[:, 0], directed[:, 1])
+        forward = directed[:, 0] < directed[:, 1]
+        key = lo * n_v + hi
+
+        _, edge_id, counts = np.unique(key, return_inverse=True, return_counts=True)
+        n_forward = np.bincount(edge_id, weights=forward, minlength=len(counts))
+        unbalanced = 2 * n_forward != counts
+        if np.any(unbalanced):
+            e = np.flatnonzero(unbalanced[edge_id])[0]
+            a, b = directed[e]
+            if counts[edge_id[e]] == 1:
+                raise ValueError(
+                    f"edge {a}-{b} belongs to only one face; surface is not closed"
+                )
+            if counts[edge_id[e]] == 2:
                 raise ValueError(
                     f"edge {a}->{b} is traversed twice in the same direction; "
                     "faces are not consistently oriented"
                 )
-            key[(a, b)] = f
-        edges, face_a, face_b = [], [], []
-        for (a, b), f in key.items():
-            if a < b:
-                if (b, a) not in key:
-                    raise ValueError(f"edge {a}-{b} belongs to only one face; surface is not closed")
-                edges.append((a, b))
-                face_a.append(f)
-                face_b.append(key[(b, a)])
-        if len(edges) * 2 != len(directed):
-            raise ValueError("surface is not closed")
-        self._edges = np.asarray(edges, dtype=np.intp)
-        # face_a traverses the edge a -> b, face_b traverses it b -> a.
-        self._edge_faces = np.asarray([face_a, face_b], dtype=np.intp).T
+            raise ValueError(
+                f"edge {a}-{b} is traversed {int(n_forward[edge_id[e]])} times one way "
+                f"and {int(counts[edge_id[e]] - n_forward[edge_id[e]])} times the other; "
+                "surface is not closed or not consistently oriented"
+            )
+
+        # Shells: faces connected across ordinary (two-face) edges.
+        ordinary = counts[edge_id] == 2
+        order = np.argsort(edge_id[ordinary], kind="stable")
+        pair_owner = owner[ordinary][order].reshape(-1, 2)
+        graph = coo_array(
+            (np.ones(len(pair_owner)), (pair_owner[:, 0], pair_owner[:, 1])),
+            shape=(n_faces, n_faces),
+        )
+        n_shells, shell = connected_components(graph, directed=False)
+
+        # Pair forward with backward traversals of each edge within each shell.
+        # Sorting by (edge, shell, direction) puts each group's k backward
+        # traversals before its k forward ones.
+        sort = np.lexsort((forward, shell[owner], edge_id))
+        group_key = edge_id[sort] * n_shells + shell[owner][sort]
+        starts = np.flatnonzero(np.r_[True, group_key[1:] != group_key[:-1]])
+        sizes = np.diff(np.r_[starts, len(sort)])
+        n_fwd_group = np.add.reduceat(forward[sort].astype(np.intp), starts)
+        if np.any(2 * n_fwd_group != sizes):
+            g = np.flatnonzero(2 * n_fwd_group != sizes)[0]
+            a, b = directed[sort[starts[g]]]
+            raise ValueError(
+                f"the faces meeting at edge {a}-{b} do not form closed shells; "
+                "the surface is not a valid boundary of a solid"
+            )
+        half = np.repeat(sizes // 2, sizes // 2)
+        first = np.repeat(starts, sizes // 2)
+        rank = np.arange(len(first)) - np.repeat(
+            np.cumsum(sizes // 2) - sizes // 2, sizes // 2
+        )
+        backward_idx = sort[first + rank]
+        forward_idx = sort[first + half + rank]
+
+        self._shell = shell
+        self._edges = directed[forward_idx]
+        # Indices into the directed edges: face A traverses the edge a -> b,
+        # face B traverses it b -> a.
+        self._edge_directed = np.stack([forward_idx, backward_idx], axis=-1)
+        self._edge_faces = owner[self._edge_directed]
+
+    def _orient_shells(self):
+        """Wind each shell so its normals point out of the body.
+
+        A shell enclosed by an even number of other shells bounds material and
+        is wound outward; one enclosed by an odd number bounds a cavity and is
+        wound inward, i.e. pointing out of the material into the cavity.
+        """
+        shell = self._shell
+        n_shells = shell.max() + 1
+        v = self._vertices[self._faces]
+        signed = np.bincount(
+            shell,
+            weights=np.einsum("ij,ij->i", v[:, 0], np.cross(v[:, 1], v[:, 2])),
+            minlength=n_shells,
+        )
+        if np.any(signed == 0):
+            raise ValueError("polyhedron has a shell with zero volume")
+
+        depth = np.zeros(n_shells, dtype=np.intp)
+        if n_shells > 1:
+            lo = np.full((n_shells, 3), np.inf)
+            hi = np.full((n_shells, 3), -np.inf)
+            np.minimum.at(lo, shell, v.min(axis=1))
+            np.maximum.at(hi, shell, v.max(axis=1))
+            # Shell s can only be inside shell t if t's bounding box holds s's.
+            within = np.all(lo[:, None] >= lo[None], axis=-1) & np.all(
+                hi[:, None] <= hi[None], axis=-1
+            )
+            np.fill_diagonal(within, False)
+            for s, t in zip(*np.nonzero(within)):
+                depth[s] += self._shell_contains(t, s)
+
+        want_positive = depth % 2 == 0
+        flip = (signed > 0) != want_positive
+        if np.any(flip):
+            flip_faces = flip[shell]
+            self._faces[flip_faces] = self._faces[flip_faces, ::-1]
+            self._build_edges()
+
+    def _shell_contains(self, t, s):
+        """Whether shell ``s`` lies inside shell ``t``.
+
+        Shells do not cross, so it is enough to test points of ``s`` with the
+        generalized winding number of ``t``, skipping points on ``t``'s surface
+        (where the shells touch) until one is clearly inside or outside.
+        """
+        v = self._vertices
+        tri = v[self._faces[self._shell == t]]
+        points = v[self._faces[self._shell == s]].mean(axis=1)
+        for block in np.array_split(points, max(1, len(points) // 16)):
+            r = tri[None, :, :, :] - block[:, None, None, :]
+            winding = np.abs(
+                triangle_solid_angle(*np.moveaxis(r.reshape(*r.shape[:2], 9), -1, 0)).sum(axis=-1)
+            ) / (4 * np.pi)
+            decided = (winding < _WINDING_TOL) | (np.abs(winding - 1) < _WINDING_TOL)
+            if np.any(decided):
+                return bool(winding[np.argmax(decided)] > 0.5)
+        raise ValueError(
+            f"could not tell whether shell {s} is inside shell {t}; "
+            "shells must not overlap"
+        )
 
     def _build_dyads(self):
         v = self._vertices
@@ -318,12 +467,12 @@ class BasePolyhedron:
         self._face_normals = n_g
         self._face_dyads = n_g[:, :, None] * n_g[:, None, :]
 
-        # Directed boundary edges of the polygons, grouped by polygon.
-        directed = np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]])
+        # Directed boundary edges of the polygons, grouped by polygon: all but
+        # the two traversals of each edge merged away between coplanar faces.
+        directed = self._directed_edges()
         owner = group[np.tile(np.arange(n_faces), 3)]
-        n_v = len(v)
-        key = lambda e: np.minimum(e[:, 0], e[:, 1]) * n_v + np.maximum(e[:, 0], e[:, 1])
-        boundary = ~np.isin(key(directed), key(self._edges[coplanar]))
+        boundary = np.ones(len(directed), dtype=bool)
+        boundary[self._edge_directed[coplanar].ravel()] = False
         directed, owner = directed[boundary], owner[boundary]
         sort = np.argsort(owner, kind="stable")
         self._face_edges = directed[sort]
@@ -332,6 +481,7 @@ class BasePolyhedron:
 
         self._edges = self._edges[~coplanar]
         self._edge_faces = self._edge_faces[~coplanar]
+        self._edge_directed = self._edge_directed[~coplanar]
         n_a, n_b = n_a[~coplanar], n_b[~coplanar]
 
         a, b = self._edges[:, 0], self._edges[:, 1]
@@ -381,48 +531,79 @@ class BasePolyhedron:
         w = np.einsum("ij,ij->i", v[:, 0], np.cross(v[:, 1], v[:, 2]))
         return (w[:, None] * v.sum(axis=1)).sum(axis=0) / (4.0 * w.sum())
 
-    def _kernel_terms(self, xyz):
-        """Edge and face terms at the (n, 3) observation points.
+    def _evaluate(self, xyz, order=None, inside_fraction=False):
+        """Newtonian integrals and/or the inside fraction at (..., 3) points.
 
-        Returns r_e (n, n_edges, 3) and r_b (n, n_edges, 3), the vectors to each
-        edge's two end points, L_e (n, n_edges), h_f (n, n_faces), the distance
-        along each face normal to the face's plane, and omega_f (n, n_faces).
+        ``order`` is None (skip), 0 (V), 1 (grad V) or 2 (Hessian of V). The
+        edge and face terms are summed in blocks of about ``_BLOCK_SIZE``
+        (point, edge) pairs into the (n_points, ...) outputs, so the memory used
+        scales with the output, independent of the body's number of edges.
+
+        Returns ``(integrals, fraction)``, either of which is None when not
+        requested. The fraction of a small sphere about each point inside the
+        body is one inside, zero outside, and on the surface the solid angle of
+        the body seen from the point over 4 pi, e.g. 1/2 on a face.
         """
-        r = self._vertices[None, :, :] - xyz[:, None, :]
+        if order not in (None, 0, 1, 2):
+            raise ValueError(f"order must be 0, 1 or 2, got {order}")
+        shape = xyz.shape[:-1]
+        pts = xyz.reshape(-1, 3)
+        n_pts = len(pts)
+        block = max(1, _BLOCK_SIZE // max(n_pts, 1))
+        v = self._vertices
 
-        a, b = self._edges[:, 0], self._edges[:, 1]
-        r_e, r_b = r[:, a], r[:, b]
-        L = polyhedron_edge_log(
-            r_e[..., 0], r_e[..., 1], r_e[..., 2], r_b[..., 0], r_b[..., 1], r_b[..., 2]
-        )
+        out = None
+        if order is not None:
+            out = np.zeros((n_pts,) + (3,) * order)
+            for s in range(0, len(self._edges), block):
+                e = slice(s, s + block)
+                r_a = v[self._edges[e, 0]] - pts[:, None, :]
+                r_b = v[self._edges[e, 1]] - pts[:, None, :]
+                L = polyhedron_edge_log(*np.moveaxis(r_a, -1, 0), *np.moveaxis(r_b, -1, 0))
+                out += _edge_newtonian(
+                    order, r_a, r_b, L, self._edge_lengths[e], self._edge_dyads[e]
+                )
 
-        n = self._face_normals
-        h = np.einsum("nfi,fi->nf", r[:, self._face_ref], n)
-        grp = self._face_edge_group
-        r1, r2 = r[:, self._face_edges[:, 0]], r[:, self._face_edges[:, 1]]
-        n_e = n[grp]
-        omega = face_edge_solid_angle(
-            r1[..., 0], r1[..., 1], r1[..., 2],
-            r2[..., 0], r2[..., 1], r2[..., 2],
-            n_e[:, 0], n_e[:, 1], n_e[:, 2],
-            h[:, grp],
-        )
-        omega = np.add.reduceat(omega, self._face_edge_starts, axis=-1)
-        return r_e, r_b, L, h, omega
+        omega_sum = np.zeros(n_pts) if inside_fraction else None
+        # Blocks of whole polygons, holding about ``block`` boundary edges each.
+        n_poly = len(self._face_normals)
+        starts = np.r_[self._face_edge_starts, len(self._face_edges)]
+        p0 = 0
+        while p0 < n_poly:
+            p1 = np.searchsorted(starts, starts[p0] + block, side="right") - 1
+            p1 = min(max(p1, p0 + 1), n_poly)
+            e0, e1 = starts[p0], starts[p1]
+            n = self._face_normals[p0:p1]
+            h = np.einsum("npi,pi->np", v[self._face_ref[p0:p1]] - pts[:, None, :], n)
+            local = self._face_edge_group[e0:e1] - p0
+            r1 = v[self._face_edges[e0:e1, 0]] - pts[:, None, :]
+            r2 = v[self._face_edges[e0:e1, 1]] - pts[:, None, :]
+            omega = face_edge_solid_angle(
+                *np.moveaxis(r1, -1, 0),
+                *np.moveaxis(r2, -1, 0),
+                *n[local].T,
+                h[:, local],
+            )
+            omega = np.add.reduceat(omega, starts[p0:p1] - e0, axis=-1)
+            if out is not None:
+                out += _face_newtonian(order, h, omega, n, self._face_dyads[p0:p1])
+            if inside_fraction:
+                omega_sum += omega.sum(axis=-1)
+            p0 = p1
+
+        if out is not None:
+            out = out.reshape(*shape, *out.shape[1:])
+        frac = None
+        if inside_fraction:
+            frac = _inside_fraction(omega_sum[:, None]).reshape(shape)
+        return out, frac
 
     def _newtonian_integrals(self, xyz, order):
-        """V, grad V and/or the Hessian of V at observation points.
+        """V, grad V or the Hessian of V at observation points.
 
         ``order`` is 0 (V), 1 (grad V) or 2 (Hessian). ``xyz`` is (..., 3).
         """
-        shape = xyz.shape[:-1]
-        pts = xyz.reshape(-1, 3)
-        r_e, r_b, L, h, omega = self._kernel_terms(pts)
-        out = _combine_newtonian(
-            order, r_e, r_b, L, self._edge_lengths, self._edge_dyads,
-            h, omega, self._face_normals, self._face_dyads,
-        )
-        return out.reshape(*shape, *out.shape[1:])
+        return self._evaluate(xyz, order)[0]
 
     def _inside_fraction(self, xyz):
         """Fraction of a small sphere about each (..., 3) point inside the body.
@@ -430,9 +611,7 @@ class BasePolyhedron:
         One inside, zero outside, and on the surface the solid angle of the body
         seen from the point over 4 pi, e.g. 1/2 on a face.
         """
-        shape = xyz.shape[:-1]
-        omega = self._kernel_terms(xyz.reshape(-1, 3))[-1]
-        return _inside_fraction(omega).reshape(shape)
+        return self._evaluate(xyz, inside_fraction=True)[1]
 
 
 class BaseTetrahedron(BasePolyhedron):
